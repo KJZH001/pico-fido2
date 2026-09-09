@@ -1,3 +1,5 @@
+# 这是v1版本的构建Action
+# 它很简短，但是没有任何的安全检查
 name: Build ESP32-S3
 
 on:
