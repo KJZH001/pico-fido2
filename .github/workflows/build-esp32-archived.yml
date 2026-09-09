@@ -1,0 +1,35 @@
+name: Build ESP32-S3
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build with ESP-IDF 5.5
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/project" \
+            -w /project \
+            -e IDF_GIT_SAFE_DIR=/project \
+            espressif/idf:v5.5 \
+            bash -lc '
+              idf.py set-target esp32s3
+              idf.py all
+              cd build
+              esptool.py --chip ESP32-S3 merge_bin \
+                -o pico_fido_esp32s3.bin @flash_args
+            '
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: librekeys-esp32s3
+          path: build/pico_fido_esp32s3.bin
