@@ -3,16 +3,27 @@ name: Build ESP32-S3
 on:
   workflow_dispatch:
 
+# 创建 tag / Release 需要写仓库内容权限
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
+      # ============================================================
+      # 1. Checkout
+      # ============================================================
       - name: Checkout
         uses: actions/checkout@v4
         with:
           submodules: recursive
+          fetch-depth: 0
 
+      # ============================================================
+      # 2. Build
+      # ============================================================
       - name: Build with ESP-IDF 5.5
         run: |
           docker run --rm \
@@ -21,15 +32,513 @@ jobs:
             -e IDF_GIT_SAFE_DIR=/project \
             espressif/idf:v5.5 \
             bash -lc '
+              set -e
+
+              echo "===== ESP-IDF version ====="
+              idf.py --version
+
+              echo "===== Configure target ====="
               idf.py set-target esp32s3
+
+              echo "===== Build ====="
               idf.py all
-              cd build
-              esptool.py --chip ESP32-S3 merge_bin \
-                -o pico_fido_esp32s3.bin @flash_args
             '
 
-      - name: Upload firmware
+      # ============================================================
+      # 3. Security configuration check
+      #
+      # 任何可能造成 Secure Boot / Flash Encryption /
+      # Anti-Rollback 等不可逆行为的配置均视为失败。
+      # ============================================================
+      - name: Security safety check
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -f sdkconfig ]; then
+            echo "::error::sdkconfig not found"
+            exit 1
+          fi
+
+          echo "===== Relevant security configuration ====="
+
+          grep -E \
+            '^(# )?CONFIG_(SECURE_BOOT|SECURE_SIGNED|SECURE_FLASH|BOOTLOADER_APP_ANTI_ROLLBACK|BOOTLOADER_APP_SECURE_VERSION|BOOTLOADER_ANTI_ROLLBACK_ENABLE|BOOTLOADER_SECURE_VERSION)' \
+            sdkconfig || true
+
+          DANGEROUS_OPTIONS=(
+            CONFIG_SECURE_BOOT
+            CONFIG_SECURE_BOOT_V2_ENABLED
+            CONFIG_SECURE_BOOT_BUILD_SIGNED_BINARIES
+            CONFIG_SECURE_SIGNED_APPS_NO_SECURE_BOOT
+            CONFIG_SECURE_FLASH_ENC_ENABLED
+            CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK
+            CONFIG_BOOTLOADER_ANTI_ROLLBACK_ENABLE
+          )
+
+          BAD=0
+
+          for opt in "${DANGEROUS_OPTIONS[@]}"; do
+            if grep -q "^${opt}=y$" sdkconfig; then
+              echo "::error::Dangerous security option enabled: ${opt}=y"
+              BAD=1
+            fi
+          done
+
+          # --------------------------------------------------------
+          # secure_version 即使配置存在，也必须保持 0
+          # --------------------------------------------------------
+          APP_SECURE_VERSION="$(
+            sed -n 's/^CONFIG_BOOTLOADER_APP_SECURE_VERSION=//p' sdkconfig \
+            | tail -n 1
+          )"
+
+          BOOT_SECURE_VERSION="$(
+            sed -n 's/^CONFIG_BOOTLOADER_SECURE_VERSION=//p' sdkconfig \
+            | tail -n 1
+          )"
+
+          APP_SECURE_VERSION="${APP_SECURE_VERSION:-0}"
+          BOOT_SECURE_VERSION="${BOOT_SECURE_VERSION:-0}"
+
+          if (( APP_SECURE_VERSION != 0 )); then
+            echo "::error::Application secure version is not zero: ${APP_SECURE_VERSION}"
+            BAD=1
+          fi
+
+          if (( BOOT_SECURE_VERSION != 0 )); then
+            echo "::error::Bootloader secure version is not zero: ${BOOT_SECURE_VERSION}"
+            BAD=1
+          fi
+
+          if [ "$BAD" -ne 0 ]; then
+            echo
+            echo "::error::SECURITY CHECK FAILED"
+            echo "::error::This build may enable irreversible ESP32-S3 security state."
+            echo "::error::No firmware or GitHub Release will be published."
+            exit 1
+          fi
+
+          echo
+          echo "=============================================="
+          echo " SECURITY CHECK PASSED"
+          echo "=============================================="
+          echo "Secure Boot:             disabled"
+          echo "Flash Encryption:        disabled"
+          echo "Application anti-rollback: disabled"
+          echo "Bootloader anti-rollback:  disabled"
+          echo "Application secure_version: ${APP_SECURE_VERSION}"
+          echo "Bootloader secure_version:  ${BOOT_SECURE_VERSION}"
+
+      # ============================================================
+      # 4. Create firmware image + inspection report
+      # ============================================================
+      - name: Merge and inspect firmware
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/project" \
+            -w /project \
+            -e IDF_GIT_SAFE_DIR=/project \
+            -e NO_COLOR=1 \
+            espressif/idf:v5.5 \
+            bash -lc '
+              set -euo pipefail
+
+              mkdir -p release
+
+              echo "===== ESP-IDF version =====" \
+                > release/toolchain-info.txt
+              idf.py --version \
+                >> release/toolchain-info.txt
+
+              echo >> release/toolchain-info.txt
+              echo "===== esptool version =====" \
+                >> release/toolchain-info.txt
+              esptool.py version \
+                >> release/toolchain-info.txt 2>&1 || true
+
+              echo "===== Merge firmware ====="
+
+              cd build
+
+              esptool.py \
+                --chip ESP32-S3 \
+                merge_bin \
+                -o ../release/pico_fido_esp32s3.bin \
+                @flash_args
+
+              cd ..
+
+              # ----------------------------------------------------
+              # 保存 ESP-IDF 烧录参数
+              # ----------------------------------------------------
+              cp build/flash_args release/flash_args
+
+              if [ -f build/flasher_args.json ]; then
+                cp build/flasher_args.json \
+                  release/flasher_args.json
+              fi
+
+              # ----------------------------------------------------
+              # 保存最终 sdkconfig
+              # ----------------------------------------------------
+              cp sdkconfig release/sdkconfig
+
+              # ----------------------------------------------------
+              # 自动从 flash_args 中找出所有原始 .bin
+              #
+              # 输出示例：
+              # 0x0-bootloader.bin
+              # 0x8000-partition-table.bin
+              # 0x10000-pico_fido2.bin
+              # ----------------------------------------------------
+              echo "===== Flash segments =====" \
+                > release/flash-layout.txt
+
+              while read -r offset file rest; do
+                if [[ "$offset" =~ ^0x[0-9A-Fa-f]+$ ]] \
+                   && [[ "$file" == *.bin ]]; then
+
+                  if [ ! -f "build/$file" ]; then
+                    echo "Referenced file not found: build/$file" >&2
+                    exit 1
+                  fi
+
+                  base="$(basename "$file")"
+                  safe_offset="${offset}"
+
+                  echo "${offset}  ${file}" \
+                    >> release/flash-layout.txt
+
+                  cp "build/$file" \
+                    "release/${safe_offset}-${base}"
+                fi
+              done < build/flash_args
+
+              # ----------------------------------------------------
+              # image_info:
+              # 只解析真正的 ESP executable image。
+              # partition-table / ota data 并不是 executable image。
+              # ----------------------------------------------------
+              : > release/image-info.txt
+
+              while read -r offset file rest; do
+                if [[ "$offset" =~ ^0x[0-9A-Fa-f]+$ ]] \
+                   && [[ "$file" == *.bin ]]; then
+
+                  case "$file" in
+                    *partition-table*|*partition_table*|*ota_data*)
+                      continue
+                      ;;
+                  esac
+
+                  echo \
+                    "==================================================" \
+                    >> release/image-info.txt
+
+                  echo \
+                    "IMAGE: ${offset} ${file}" \
+                    >> release/image-info.txt
+
+                  echo \
+                    "==================================================" \
+                    >> release/image-info.txt
+
+                  esptool.py \
+                    --chip ESP32-S3 \
+                    image_info \
+                    --version 2 \
+                    "build/$file" \
+                    >> release/image-info.txt 2>&1 || true
+
+                  echo \
+                    >> release/image-info.txt
+
+                fi
+              done < build/flash_args
+            '
+
+      # ============================================================
+      # 5. Generate manifest / checksums / release notes
+      # ============================================================
+      - name: Generate manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SHORT_SHA="${GITHUB_SHA::7}"
+
+          RELEASE_TAG="esp32s3-r${GITHUB_RUN_NUMBER}-a${GITHUB_RUN_ATTEMPT}-${SHORT_SHA}"
+
+          RELEASE_TITLE="LibreKeys ESP32-S3 ${SHORT_SHA} (Run ${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT})"
+
+          echo "RELEASE_TAG=${RELEASE_TAG}" >> "$GITHUB_ENV"
+          echo "RELEASE_TITLE=${RELEASE_TITLE}" >> "$GITHUB_ENV"
+
+          APP_SECURE_VERSION="$(
+            sed -n 's/^CONFIG_BOOTLOADER_APP_SECURE_VERSION=//p' sdkconfig \
+            | tail -n 1
+          )"
+
+          BOOT_SECURE_VERSION="$(
+            sed -n 's/^CONFIG_BOOTLOADER_SECURE_VERSION=//p' sdkconfig \
+            | tail -n 1
+          )"
+
+          APP_SECURE_VERSION="${APP_SECURE_VERSION:-0}"
+          BOOT_SECURE_VERSION="${BOOT_SECURE_VERSION:-0}"
+
+          IDF_VERSION="$(
+            head -n 5 release/toolchain-info.txt \
+            | tail -n +2 \
+            | head -n 1
+          )"
+
+          # --------------------------------------------------------
+          # 保存源代码追溯信息
+          # --------------------------------------------------------
+          cat > release/source-info.txt <<EOF
+          Repository: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}
+          Commit: ${GITHUB_SHA}
+          Ref: ${GITHUB_REF}
+          Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          Run number: ${GITHUB_RUN_NUMBER}
+          Run attempt: ${GITHUB_RUN_ATTEMPT}
+          ESP-IDF image: espressif/idf:v5.5
+          EOF
+
+          # --------------------------------------------------------
+          # Human readable manifest
+          # --------------------------------------------------------
+          cat > release/BUILD-MANIFEST.txt <<EOF
+          LibreKeys pico-fido2 - ESP32-S3 Build Manifest
+          ==================================================
+
+          Source repository:
+          ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}
+
+          Commit:
+          ${GITHUB_SHA}
+
+          Git ref:
+          ${GITHUB_REF}
+
+          Workflow:
+          ${GITHUB_WORKFLOW}
+
+          Workflow run:
+          ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+
+          ESP-IDF container:
+          espressif/idf:v5.5
+
+          Target:
+          ESP32-S3
+
+          Merged firmware:
+          pico_fido_esp32s3.bin
+
+          Merged firmware flash address:
+          0x0000
+
+
+          SECURITY CHECK
+          ==================================================
+
+          Result:
+          PASS
+
+          Secure Boot:
+          DISABLED
+
+          Flash Encryption:
+          DISABLED
+
+          Application anti-rollback:
+          DISABLED
+
+          Bootloader anti-rollback:
+          DISABLED
+
+          Application secure_version:
+          ${APP_SECURE_VERSION}
+
+          Bootloader secure_version:
+          ${BOOT_SECURE_VERSION}
+
+
+          IMPORTANT
+          ==================================================
+
+          This check verifies ESP-IDF build configuration related to
+          Secure Boot, Flash Encryption and anti-rollback.
+
+          It does NOT prove that application-level commands can never
+          intentionally write ESP32-S3 eFuses.
+
+          In particular, do not invoke LibreKeys/Pico FIDO secure
+          provisioning commands such as cmd_secure unless their eFuse
+          behavior has been separately reviewed.
+
+
+          FLASH LAYOUT
+          ==================================================
+
+          $(cat release/flash-layout.txt)
+
+
+          IMAGE INFORMATION
+          ==================================================
+
+          See:
+          image-info.txt
+          EOF
+
+          # --------------------------------------------------------
+          # Release Note
+          # --------------------------------------------------------
+          cat > release/RELEASE-NOTES.md <<EOF
+          ## LibreKeys pico-fido2 — ESP32-S3
+
+          Automated ESP32-S3 build from:
+
+          - **Commit:** \`${GITHUB_SHA}\`
+          - **Source:** ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}
+          - **Workflow run:** ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          - **ESP-IDF:** \`espressif/idf:v5.5\`
+          - **Target:** \`ESP32-S3\`
+
+          ### Security check
+
+          **PASS**
+
+          | Item | State |
+          |---|---|
+          | Secure Boot | **Disabled** |
+          | Flash Encryption | **Disabled** |
+          | Application anti-rollback | **Disabled** |
+          | Bootloader anti-rollback | **Disabled** |
+          | Application \`secure_version\` | \`${APP_SECURE_VERSION}\` |
+          | Bootloader \`secure_version\` | \`${BOOT_SECURE_VERSION}\` |
+
+          The workflow aborts before publishing if one of the checked
+          irreversible security features is enabled.
+
+          > **Important:** this validates the ESP-IDF build configuration.
+          > It does not guarantee that an application-level command can
+          > never intentionally write eFuses. Do not invoke
+          > \`cmd_secure\` or other secure provisioning functions without
+          > reviewing their behavior first.
+
+          ### Flashing
+
+          The merged firmware is:
+
+          \`\`\`text
+          pico_fido_esp32s3.bin
+          \`\`\`
+
+          Flash the merged image at:
+
+          \`\`\`text
+          0x0000
+          \`\`\`
+
+          ### Flash layout
+
+          \`\`\`text
+          $(cat release/flash-layout.txt)
+          \`\`\`
+
+          ### Release assets
+
+          This Release contains:
+
+          - merged firmware image
+          - every original binary referenced by ESP-IDF \`flash_args\`
+          - \`flash_args\`
+          - \`flasher_args.json\` when generated by ESP-IDF
+          - final \`sdkconfig\`
+          - image inspection report
+          - build manifest
+          - source/build metadata
+          - SHA-256 checksum list
+          EOF
+
+          # --------------------------------------------------------
+          # SHA-256
+          #
+          # SHA256SUMS 本身不计算自身。
+          # --------------------------------------------------------
+          (
+            cd release
+
+            find . \
+              -maxdepth 1 \
+              -type f \
+              ! -name 'SHA256SUMS.txt' \
+              -print0 \
+              | sort -z \
+              | xargs -0 sha256sum \
+              | sed 's#  \./#  #'
+          ) > release/SHA256SUMS.txt
+
+          echo
+          echo "===== Release files ====="
+          ls -lah release
+
+          echo
+          echo "===== SHA256SUMS ====="
+          cat release/SHA256SUMS.txt
+
+      # ============================================================
+      # 6. GitHub Actions artifact
+      #
+      # 即使之后 GitHub Release 创建失败，
+      # 本次 CI 的产物仍然可以从 Actions 下载。
+      # ============================================================
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: librekeys-esp32s3
-          path: build/pico_fido_esp32s3.bin
+          name: librekeys-esp32s3-${{ github.run_number }}-${{ github.run_attempt }}
+          path: release/
+          if-no-files-found: error
+
+      # ============================================================
+      # 7. Create a NEW GitHub Release
+      #
+      # 每次运行 tag 都包含：
+      # run number + run attempt + commit short SHA
+      #
+      # 因此不会覆盖过去的 tag / Release。
+      #
+      # 此步骤：
+      # - 不删除历史 Release
+      # - 不修改历史 Release
+      # - 不删除历史 tag
+      # - 不覆盖历史附件
+      # ============================================================
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          echo "Creating new release:"
+          echo "  Tag:   ${RELEASE_TAG}"
+          echo "  Title: ${RELEASE_TITLE}"
+
+          # 理论上 unique tag 不应存在。
+          # 如果意外撞 tag，宁可失败，也绝不覆盖旧 Release。
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "::error::Release ${RELEASE_TAG} already exists."
+            echo "::error::Refusing to overwrite or modify an existing release."
+            exit 1
+          fi
+
+          gh release create "${RELEASE_TAG}" \
+            release/* \
+            --target "${GITHUB_SHA}" \
+            --title "${RELEASE_TITLE}" \
+            --notes-file release/RELEASE-NOTES.md
