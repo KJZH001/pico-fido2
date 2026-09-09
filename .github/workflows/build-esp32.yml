@@ -117,7 +117,9 @@ jobs:
           fi
 
           if [ "$BAD" -ne 0 ]; then
+            echo
             echo "::error::SECURITY CHECK FAILED"
+            echo "::error::This build may enable irreversible ESP32-S3 security state."
             echo "::error::No firmware or GitHub Release will be published."
             exit 1
           fi
