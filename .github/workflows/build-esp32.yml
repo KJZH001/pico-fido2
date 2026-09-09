@@ -44,6 +44,11 @@ jobs:
               idf.py all
             '
 
+      # Docker 默认 root，恢复文件所有权给 GitHub Runner
+      - name: Fix build file permissions
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" build sdkconfig
+
       # ============================================================
       # 3. Security configuration check
       #
@@ -112,23 +117,18 @@ jobs:
           fi
 
           if [ "$BAD" -ne 0 ]; then
-            echo
             echo "::error::SECURITY CHECK FAILED"
-            echo "::error::This build may enable irreversible ESP32-S3 security state."
             echo "::error::No firmware or GitHub Release will be published."
             exit 1
           fi
 
-          echo
-          echo "=============================================="
-          echo " SECURITY CHECK PASSED"
-          echo "=============================================="
-          echo "Secure Boot:             disabled"
-          echo "Flash Encryption:        disabled"
+          echo "===== SECURITY CHECK PASSED ====="
+          echo "Secure Boot: disabled"
+          echo "Flash Encryption: disabled"
           echo "Application anti-rollback: disabled"
-          echo "Bootloader anti-rollback:  disabled"
+          echo "Bootloader anti-rollback: disabled"
           echo "Application secure_version: ${APP_SECURE_VERSION}"
-          echo "Bootloader secure_version:  ${BOOT_SECURE_VERSION}"
+          echo "Bootloader secure_version: ${BOOT_SECURE_VERSION}"
 
       # ============================================================
       # 4. Create firmware image + inspection report
@@ -175,8 +175,7 @@ jobs:
               cp build/flash_args release/flash_args
 
               if [ -f build/flasher_args.json ]; then
-                cp build/flasher_args.json \
-                  release/flasher_args.json
+                cp build/flasher_args.json release/flasher_args.json
               fi
 
               # ----------------------------------------------------
@@ -205,13 +204,12 @@ jobs:
                   fi
 
                   base="$(basename "$file")"
-                  safe_offset="${offset}"
 
                   echo "${offset}  ${file}" \
                     >> release/flash-layout.txt
 
                   cp "build/$file" \
-                    "release/${safe_offset}-${base}"
+                    "release/${offset}-${base}"
                 fi
               done < build/flash_args
 
@@ -251,12 +249,15 @@ jobs:
                     "build/$file" \
                     >> release/image-info.txt 2>&1 || true
 
-                  echo \
-                    >> release/image-info.txt
-
+                  echo >> release/image-info.txt
                 fi
               done < build/flash_args
             '
+
+      # Docker 又创建了 release/，再次恢复 ownership
+      - name: Fix release file permissions
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" build release sdkconfig
 
       # ============================================================
       # 5. Generate manifest / checksums / release notes
