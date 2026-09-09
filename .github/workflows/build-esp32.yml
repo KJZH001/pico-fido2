@@ -510,16 +510,15 @@ jobs:
       # ============================================================
       # 7. Create a NEW GitHub Release
       #
-      # 每次运行 tag 都包含：
-      # run number + run attempt + commit short SHA
+      # 不删除、不覆盖任何历史 Release。
       #
-      # 因此不会覆盖过去的 tag / Release。
+      # 注意：
+      # GITHUB_TOKEN 无法获得 Workflows: write 权限。
+      # 因此当当前 commit 修改了 .github/workflows/* 时，
+      # 不使用 --target "${GITHUB_SHA}"。
       #
-      # 此步骤：
-      # - 不删除历史 Release
-      # - 不修改历史 Release
-      # - 不删除历史 tag
-      # - 不覆盖历史附件
+      # 为防止 Release 指向错误 commit，只允许在当前构建 commit
+      # 正好等于默认分支 HEAD 时创建 Release。
       # ============================================================
       - name: Create GitHub Release
         shell: bash
@@ -532,16 +531,74 @@ jobs:
           echo "  Tag:   ${RELEASE_TAG}"
           echo "  Title: ${RELEASE_TITLE}"
 
-          # 理论上 unique tag 不应存在。
-          # 如果意外撞 tag，宁可失败，也绝不覆盖旧 Release。
+          # --------------------------------------------------------
+          # 不允许覆盖任何已有 Release
+          # --------------------------------------------------------
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
             echo "::error::Release ${RELEASE_TAG} already exists."
             echo "::error::Refusing to overwrite or modify an existing release."
             exit 1
           fi
 
+          # --------------------------------------------------------
+          # 查询默认分支以及它当前的 HEAD
+          # --------------------------------------------------------
+          DEFAULT_BRANCH="$(
+            gh repo view \
+              --json defaultBranchRef \
+              --jq '.defaultBranchRef.name'
+          )"
+
+          DEFAULT_SHA="$(
+            gh api \
+              "repos/${GITHUB_REPOSITORY}/commits/${DEFAULT_BRANCH}" \
+              --jq '.sha'
+          )"
+
+          echo
+          echo "Default branch: ${DEFAULT_BRANCH}"
+          echo "Default HEAD:   ${DEFAULT_SHA}"
+          echo "Built commit:   ${GITHUB_SHA}"
+
+          # --------------------------------------------------------
+          # 因为下面不能安全使用 --target GITHUB_SHA，
+          # 所以必须保证默认分支 HEAD 就是本次构建 commit。
+          # --------------------------------------------------------
+          if [ "${DEFAULT_SHA}" != "${GITHUB_SHA}" ]; then
+            echo
+            echo "::error::Built commit is not the current default branch HEAD."
+            echo "::error::Release creation aborted to avoid tagging the wrong commit."
+            exit 1
+          fi
+
+          # --------------------------------------------------------
+          # 不传 --target。
+          #
+          # GitHub 会把新 tag 创建在默认分支当前 HEAD。
+          # 上面已经确认这个 HEAD == GITHUB_SHA。
+          # --------------------------------------------------------
           gh release create "${RELEASE_TAG}" \
             release/* \
-            --target "${GITHUB_SHA}" \
             --title "${RELEASE_TITLE}" \
             --notes-file release/RELEASE-NOTES.md
+
+          echo
+          echo "Release created successfully."
+
+          # --------------------------------------------------------
+          # 发布后再次验证 tag 实际指向的 commit
+          # --------------------------------------------------------
+          RELEASE_SHA="$(
+            gh api \
+              "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" \
+              --jq '.object.sha'
+          )"
+
+          echo "Release tag SHA: ${RELEASE_SHA}"
+
+          if [ "${RELEASE_SHA}" != "${GITHUB_SHA}" ]; then
+            echo "::error::Release tag does not point to the built commit!"
+            echo "::error::Expected: ${GITHUB_SHA}"
+            echo "::error::Actual:   ${RELEASE_SHA}"
+            exit 1
+          fi
