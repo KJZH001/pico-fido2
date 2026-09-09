@@ -5,7 +5,7 @@ librekeys/pico-fido2 是 polhenarejos/pico-fido2 在转为商业化收费前的�
 
 但该分支对于 ESP32 也仅限于继承自上游的兼容性，没有经过充分的验证的同时也没有提供现成的二进制固件
 
-本仓库是出于个人自用的目的，利用 Github Action CI 完成固件云编译
+本仓库是出于个人自用的目的，利用 Github Action CI 针对 librekeys/pico-fido2 完成固件云编译
 
 ***任何情况下我们都不建议您使用来自本仓库的固件，除非您充分理解其中存在的风险并愿意自行承担后果***
 
